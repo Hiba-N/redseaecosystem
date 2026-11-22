@@ -1487,72 +1487,256 @@ cat(
 
 
 # ============================================================
-# NEW SIMULATION METHODOLOGY
+# RED SEA FISH NUTRIENT-RICHNESS SIMULATIONS
 #
-# For each pixel:
+# For every pixel:
 #   1. Select 10 species using occurrence probabilities
-#   2. Generate all 1,023 non-empty combinations
-#   3. Calculate mean values for all 13 nutrients
-#   4. Repeat 1,000 times
-#   5. Save numerical results
-#   6. Create 13 nutrient graphs
+#      as sampling weights.
+#   2. Generate all 1,023 non-empty combinations.
+#   3. Calculate mean nutrient concentration per 100 g.
+#   4. Repeat for 1,000 iterations.
+#   5. Save simulation results and graphs in that pixel's
+#      individual folder.
+#
+# Outputs per pixel:
+#   - 1 compressed CSV
+#   - 13 nutrient boxplots
+#   - 13 species-richness response curves
 # ============================================================
 
 
-# ------------------------------------------------------------
-# 1. SETTINGS
-# ------------------------------------------------------------
+# ============================================================
+# 1. LOAD LIBRARIES
+# ============================================================
+
+library(terra)
+library(dplyr)
+library(ggplot2)
+
+
+# ============================================================
+# 2. SIMULATION SETTINGS
+# ============================================================
 
 set.seed(123)
 
 n_iterations <- 1000
 n_species_selected <- 10
 
+# Set to NULL to process every pixel.
+# For a test, change to 3 to process only the first 3 pixels.
+
+pixels_to_process <- NULL
+
+
+# ============================================================
+# 3. OUTPUT FOLDER
+# ============================================================
+
+output_folder <- file.path(
+  getwd(),
+  "nutrient_richness_simulations"
+)
+
+dir.create(
+  output_folder,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# ============================================================
+# 4. CHECK INPUT DATA
+# ============================================================
+
+# These objects must already exist:
+#
+# probability_matrix
+# nutrient_matrix
+# valid_pixel_ids
+
+if (!exists("probability_matrix")) {
+  stop("probability_matrix does not exist.")
+}
+
+if (!exists("nutrient_matrix")) {
+  stop("nutrient_matrix does not exist.")
+}
+
+if (!exists("valid_pixel_ids")) {
+  stop("valid_pixel_ids does not exist.")
+}
+
+
+# Convert to matrices
+probability_matrix <- as.matrix(probability_matrix)
+nutrient_matrix <- as.matrix(nutrient_matrix)
+
+# Ensure nutrient matrix is numeric
+storage.mode(nutrient_matrix) <- "double"
+
+# Check pixel dimensions
+if (length(valid_pixel_ids) != nrow(probability_matrix)) {
+  stop("valid_pixel_ids does not match probability_matrix.")
+}
+
+# Check species dimensions
+if (ncol(probability_matrix) != nrow(nutrient_matrix)) {
+  stop("Species dimensions do not match between the two matrices.")
+}
+
+# If species names are available, ensure the rows of the
+# nutrient matrix follow the same order as probability columns.
+
+if (
+  !is.null(colnames(probability_matrix)) &&
+  !is.null(rownames(nutrient_matrix))
+) {
+  
+  if (!setequal(
+    colnames(probability_matrix),
+    rownames(nutrient_matrix)
+  )) {
+    stop("Species names do not match between the two matrices.")
+  }
+  
+  nutrient_matrix <- nutrient_matrix[
+    colnames(probability_matrix),
+    ,
+    drop = FALSE
+  ]
+}
+
+# Check nutrients
+if (ncol(nutrient_matrix) != 13) {
+  stop("Expected exactly 13 nutrient columns.")
+}
+
+if (is.null(colnames(nutrient_matrix))) {
+  stop("nutrient_matrix must have nutrient column names.")
+}
+
 nutrient_names <- colnames(nutrient_matrix)
 
-n_nutrients <- ncol(nutrient_matrix)
-n_pixels <- nrow(probability_matrix)
-n_species <- ncol(probability_matrix)
+cat("\n")
+cat("====================================================\n")
+cat("INPUT DATA CHECK\n")
+cat("====================================================\n")
 
-# Check that the nutrient data and probability matrix
-# contain the same number of species.
+cat("Number of pixels:", nrow(probability_matrix), "\n")
+cat("Number of species:", ncol(probability_matrix), "\n")
+cat("Number of nutrients:", ncol(nutrient_matrix), "\n")
+cat("Iterations per pixel:", n_iterations, "\n")
 
-if (nrow(nutrient_matrix) != n_species) {
-  stop(
-    "ERROR: nutrient_matrix rows do not match ",
-    "probability_matrix columns."
+
+# ============================================================
+# 5. SELECT PIXELS TO PROCESS
+# ============================================================
+
+if (is.null(pixels_to_process)) {
+  
+  pixels_to_process <- seq_len(
+    nrow(probability_matrix)
+  )
+  
+} else {
+  
+  pixels_to_process <- seq_len(
+    min(pixels_to_process, nrow(probability_matrix))
   )
 }
 
-if (length(valid_pixel_ids) != n_pixels) {
-  stop(
-    "ERROR: valid_pixel_ids does not match ",
-    "the number of rows in probability_matrix."
-  )
-}
-
-if (n_nutrients != 13) {
-  stop("ERROR: Expected 13 nutrient columns.")
-}
-
-if (any(!is.finite(nutrient_matrix))) {
-  stop("ERROR: nutrient_matrix contains NA or non-finite values.")
-}
+cat(
+  "Pixels selected for processing:",
+  length(pixels_to_process),
+  "\n"
+)
 
 
-# ------------------------------------------------------------
-# 2. PRE-CALCULATE ALL COMBINATION STRUCTURES
-# ------------------------------------------------------------
 
-# For 10 selected species, calculate the number of
-# possible combinations for each group size.
+# ============================================================
+# 6. PRE-CALCULATE ALL POSSIBLE COMBINATIONS
+# ============================================================
 
+# Each combination matrix will have 10 columns,
+# one for each selected species.
+#
+# 1 = species is included in the combination
+# 0 = species is not included.
+#
+# This allows matrix multiplication:
+#
+# membership (number of combinations x 10)
+# selected_nutrients (10 x 13)
+#
+# Result:
+# number of combinations x 13 nutrients
+
+
+combination_matrices <- lapply(
+  1:n_species_selected,
+  function(k) {
+    
+    # Generate combinations of species indices
+    combination_indices <- utils::combn(
+      n_species_selected,
+      k
+    )
+    
+    # Create membership matrix
+    membership <- matrix(
+      0,
+      nrow = ncol(combination_indices),
+      ncol = n_species_selected
+    )
+    
+    # Mark included species with 1
+    for (i in seq_len(ncol(combination_indices))) {
+      
+      membership[
+        i,
+        combination_indices[, i]
+      ] <- 1
+    }
+    
+    membership
+  }
+)
+
+
+# Number of combinations at each richness level
 combination_counts <- choose(
   n_species_selected,
   1:n_species_selected
 )
 
-total_combinations <- sum(combination_counts)
+# Total combinations = 1,023
+total_combinations <- sum(
+  combination_counts
+)
+
+# Richness level for every combination
+combination_richness <- rep(
+  1:n_species_selected,
+  times = combination_counts
+)
+
+# Combination numbering
+combination_number <- seq_len(
+  total_combinations
+)
+
+
+# Check dimensions
+for (k in 1:n_species_selected) {
+  
+  cat(
+    "Richness:", k,
+    "| Matrix dimensions:",
+    dim(combination_matrices[[k]]),
+    "\n"
+  )
+}
 
 cat(
   "\nTotal combinations per iteration:",
@@ -1560,176 +1744,137 @@ cat(
   "\n"
 )
 
-# Create a membership matrix for each group size.
-#
-# Each column represents one combination.
-# Each row represents one of the 10 selected species.
-#
-# A value of 1 means that species is included.
-
-combination_matrices <- vector(
-  "list",
-  n_species_selected
-)
-
-for (k in 1:n_species_selected) {
-  
-  combinations <- utils::combn(
-    n_species_selected,
-    k
-  )
-  
-  membership <- matrix(
-    0,
-    nrow = n_species_selected,
-    ncol = ncol(combinations)
-  )
-  
-  for (j in seq_len(ncol(combinations))) {
-    
-    membership[combinations[, j], j] <- 1
-    
-  }
-  
-  combination_matrices[[k]] <- membership
-  
-}
 
 
-# ------------------------------------------------------------
-# 3. COMBINATION OUTPUT INDEXING
-# ------------------------------------------------------------
+# ============================================================
+# 7. PREPARE FINAL SUMMARY TABLE
+# ============================================================
 
-# Each iteration produces 1,023 results.
-# The results are ordered from richness 1 to richness 10.
-
-combination_start <- c(
-  1,
-  head(
-    cumsum(combination_counts),
-    -1
-  ) + 1
-)
-
-combination_end <- cumsum(combination_counts)
-
-# Richness label for every combination.
-
-combination_richness <- rep(
-  1:n_species_selected,
-  times = combination_counts
-)
-
-# Combination number within each richness level.
-
-combination_number <- unlist(
-  lapply(
-    combination_counts,
-    seq_len
-  ),
-  use.names = FALSE
+pixel_summary <- data.frame(
+  pixel_number = integer(),
+  original_raster_cell = integer(),
+  status = character(),
+  output_file = character(),
+  processing_minutes = numeric(),
+  stringsAsFactors = FALSE
 )
 
 
-# ------------------------------------------------------------
-# 4. PIXEL SUMMARY STORAGE
-# ------------------------------------------------------------
+# ============================================================
+# 8. LOOP THROUGH PIXELS
+# ============================================================
 
-pixel_summary <- vector(
-  "list",
-  n_pixels
-)
-
-
-# ------------------------------------------------------------
-# 5. MAIN PIXEL LOOP
-# ------------------------------------------------------------
-
-for (pixel in seq_len(n_pixels)) {
+for (pixel in pixels_to_process) {
   
-  pixel_start_time <- Sys.time()
+  start_time <- Sys.time()
   
+  # Original raster cell identifier
   original_cell <- valid_pixel_ids[pixel]
   
+  # Sequential pixel numbering
   pixel_id <- sprintf(
-    "pixel_%06d",
-    original_cell
-  )
-  
-  cat(
-    "\n\n====================================\n"
-  )
-  
-  cat(
-    "Processing pixel",
-    pixel,
-    "of",
-    n_pixels,
-    "|",
-    pixel_id,
-    "\n"
-  )
-  
-  cat(
-    "====================================\n"
+    "pixel_%03d",
+    pixel
   )
   
   
-  # ----------------------------------------------------------
-  # 5A. RETRIEVE PROBABILITIES FOR THIS PIXEL
-  # ----------------------------------------------------------
+  # ==========================================================
+  # 8A. CREATE INDIVIDUAL PIXEL FOLDERS
+  # ==========================================================
   
-  # This retrieves values from the existing matrix.
-  # It does NOT read the raster files again.
+  pixel_folder <- file.path(
+    output_folder,
+    pixel_id
+  )
+  
+  results_folder <- file.path(
+    pixel_folder,
+    "pixel_simulation_results"
+  )
+  
+  boxplot_folder <- file.path(
+    pixel_folder,
+    "boxplots"
+  )
+  
+  response_folder <- file.path(
+    pixel_folder,
+    "species_richness_response_curves"
+  )
+  
+  dir.create(
+    results_folder,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  dir.create(
+    boxplot_folder,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  dir.create(
+    response_folder,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  
+  # ==========================================================
+  # 8B. PIXEL INFORMATION
+  # ==========================================================
+  
+  cat("\n")
+  cat("====================================================\n")
+  cat("PROCESSING:", pixel_id, "\n")
+  cat("Original raster cell:", original_cell, "\n")
+  cat("====================================================\n")
+  
+  
+  # ==========================================================
+  # 8C. GET OCCURRENCE PROBABILITIES
+  # ==========================================================
   
   pixel_probabilities <- as.numeric(
     probability_matrix[pixel, ]
   )
   
-  # Identify species with positive occurrence probability.
-  
+  # Only species with positive, finite probabilities
   eligible_species <- which(
     is.finite(pixel_probabilities) &
       pixel_probabilities > 0
   )
   
-  n_eligible <- length(eligible_species)
-  
   cat(
-    "Eligible species:",
-    n_eligible,
+    "Species with positive occurrence probability:",
+    length(eligible_species),
     "\n"
   )
   
-  
-  # ----------------------------------------------------------
-  # 5B. CHECK WHETHER 10 SPECIES CAN BE SELECTED
-  # ----------------------------------------------------------
-  
-  if (n_eligible < n_species_selected) {
+  # Skip pixels with fewer than 10 eligible species
+  if (length(eligible_species) < n_species_selected) {
     
-    cat(
-      "Skipping pixel:",
-      "fewer than 10 eligible species.\n"
-    )
+    cat("SKIPPED: Fewer than 10 eligible species.\n")
     
-    pixel_summary[[pixel]] <- data.frame(
-      pixel_id = pixel_id,
-      original_raster_cell = original_cell,
-      eligible_species = n_eligible,
-      status = "Skipped: fewer than 10 species",
-      output_file = NA_character_,
-      processing_minutes = NA_real_
+    pixel_summary <- rbind(
+      pixel_summary,
+      data.frame(
+        pixel_number = pixel,
+        original_raster_cell = original_cell,
+        status = "Skipped - fewer than 10 eligible species",
+        output_file = NA_character_,
+        processing_minutes = NA_real_
+      )
     )
     
     next
-    
   }
   
   
-  # ----------------------------------------------------------
-  # 5C. PREPARE NUMERICAL RESULT STORAGE
-  # ----------------------------------------------------------
+  # ==========================================================
+  # 8D. CREATE RESULTS ARRAY
+  # ==========================================================
   
   # Dimensions:
   #
@@ -1737,46 +1882,60 @@ for (pixel in seq_len(n_pixels)) {
   # 13 nutrients
   # 1,000 iterations
   #
-  # This allocates the storage once, rather than creating
-  # and combining a data frame for every simulation.
+  # Approximately 106 MB of numeric data.
   
   results_array <- array(
     NA_real_,
     dim = c(
       total_combinations,
-      n_nutrients,
+      ncol(nutrient_matrix),
       n_iterations
+    ),
+    dimnames = list(
+      NULL,
+      nutrient_names,
+      NULL
     )
   )
   
   
-  # ----------------------------------------------------------
-  # 5D. PREPARE OUTPUT FILE
-  # ----------------------------------------------------------
+  # ==========================================================
+  # 8E. CREATE COMPRESSED CSV
+  # ==========================================================
   
-  csv_file <- file.path(
+  output_file <- file.path(
     results_folder,
-    paste0(pixel_id, "_simulation_results.csv.gz")
+    paste0(
+      pixel_id,
+      "_simulation_results.csv.gz"
+    )
   )
   
   output_connection <- gzfile(
-    csv_file,
+    output_file,
     open = "wt"
   )
   
+  on.exit(close(output_connection), add = TRUE)
+
   
-  # ----------------------------------------------------------
-  # 5E. REPEAT 1,000 SELECTIONS
-  # ----------------------------------------------------------
+  
+  # ==========================================================
+  # 9. RUN 1,000 ITERATIONS
+  # ==========================================================
   
   for (iteration in seq_len(n_iterations)) {
     
+    
     # --------------------------------------------------------
-    # STEP 1: SELECT 10 DIFFERENT SPECIES
+    # STEP 1. SELECT 10 SPECIES
     # --------------------------------------------------------
     
-    # Sampling is weighted by occurrence probability.
+    # Selection is weighted by occurrence probability.
+    #
     # Sampling is without replacement.
+    #
+    # Each iteration selects a new group of 10 species.
     
     selected_species <- sample(
       eligible_species,
@@ -1787,7 +1946,7 @@ for (pixel in seq_len(n_pixels)) {
     
     
     # --------------------------------------------------------
-    # STEP 2: RETRIEVE THEIR 13 NUTRIENT VALUES
+    # STEP 2. GET NUTRIENT VALUES
     # --------------------------------------------------------
     
     selected_nutrients <- nutrient_matrix[
@@ -1796,227 +1955,502 @@ for (pixel in seq_len(n_pixels)) {
       drop = FALSE
     ]
     
+    # Identify missing and non-finite values
+    missing_indicator <- !is.finite(
+      selected_nutrients
+    )
+    
+    # Replace missing values with zero for summation.
+    # They will not be included in the nutrient denominator.
+    
+    selected_nutrients[missing_indicator] <- 0
+    
     
     # --------------------------------------------------------
-    # STEP 3: CALCULATE ALL 1,023 COMBINATIONS
+    # STEP 3. CALCULATE ALL 1,023 COMBINATIONS
     # --------------------------------------------------------
+    
+    iteration_results <- matrix(
+      NA_real_,
+      nrow = total_combinations,
+      ncol = ncol(nutrient_matrix)
+    )
+    
+    colnames(iteration_results) <- nutrient_names
+    
+    combination_start <- 1
     
     for (k in 1:n_species_selected) {
       
-      # The membership matrix identifies which of the
-      # 10 selected species belong to each combination.
-      
       membership <- combination_matrices[[k]]
       
-      # Matrix multiplication calculates the sum of each
-      # nutrient across every combination.
-      #
-      # Dividing by k gives the arithmetic mean.
-      #
-      # Each fish contributes equally.
+      combination_end <- (
+        combination_start +
+          nrow(membership) - 1
+      )
       
-      combination_means <- (
-        t(membership) %*% selected_nutrients
-      ) / k
+      # Sum nutrient values for every combination
+      nutrient_sums <- membership %*%
+        selected_nutrients
       
-      # Store the results in the preallocated array.
+      # Count available nutrient observations
+      nutrient_counts <- membership %*%
+        (!missing_indicator * 1)
       
-      result_rows <- combination_start[k]:
-        combination_end[k]
+      # Arithmetic mean:
+      # each fish contributes equally.
       
-      results_array[
-        result_rows,
-        ,
-        iteration
+      combination_means <- nutrient_sums /
+        nutrient_counts
+      
+      # Assign NA if no species in a combination
+      # has an available value for that nutrient.
+      
+      combination_means[
+        nutrient_counts == 0
+      ] <- NA_real_
+      
+      # Store results
+      iteration_results[
+        combination_start:combination_end,
       ] <- combination_means
       
+      combination_start <- combination_end + 1
     }
     
     
     # --------------------------------------------------------
-    # STEP 4: SAVE THIS ITERATION'S NUMERICAL RESULTS
+    # STEP 4. STORE RESULTS IN ARRAY
     # --------------------------------------------------------
     
-    iteration_results <- data.frame(
+    results_array[, , iteration] <- iteration_results
+    
+    
+    # --------------------------------------------------------
+    # STEP 5. WRITE ITERATION RESULTS TO CSV
+    # --------------------------------------------------------
+    
+    iteration_output <- data.frame(
       iteration = iteration,
       species_richness = combination_richness,
       combination = combination_number,
-      as.data.frame(
-        results_array[, , iteration, drop = FALSE][, , 1]
-      ),
+      iteration_results,
       check.names = FALSE
     )
     
-    names(iteration_results)[4:(
-      3 + n_nutrients
-    )] <- nutrient_names
-    
     write.table(
-      iteration_results,
+      iteration_output,
       file = output_connection,
       sep = ",",
       row.names = FALSE,
       col.names = (iteration == 1),
-      qmethod = "double"
+      na = ""
     )
     
     
     # --------------------------------------------------------
-    # STEP 5: REPORT PROGRESS
+    # STEP 6. PROGRESS
     # --------------------------------------------------------
     
-    if (
-      iteration %% 100 == 0 ||
-      iteration == n_iterations
-    ) {
+    if (iteration %% 100 == 0) {
       
       cat(
-        "\rPixel:",
-        pixel,
-        "| Iteration:",
+        pixel_id,
+        "- completed iteration",
         iteration,
-        "/",
-        n_iterations
+        "of",
+        n_iterations,
+        "\n"
       )
-      
-      flush.console()
-      
     }
-    
   }
   
   
-  # Close the compressed CSV file.
-  
+  # Close compressed CSV
   close(output_connection)
   
-  cat("\nNumerical results saved.\n")
   
+  # ==========================================================
+  # 10. GENERATE 13 BOXPLOTS
+  # ==========================================================
   
-  # ----------------------------------------------------------
-  # 5F. CREATE 13 NUTRIENT GRAPHS
-  # ----------------------------------------------------------
+  cat("\nGenerating boxplots for", pixel_id, "...\n")
   
-  cat("Creating nutrient graphs...\n")
-  
-  for (nutrient_index in seq_len(n_nutrients)) {
+  for (nutrient_index in seq_along(nutrient_names)) {
     
     nutrient_name <- nutrient_names[nutrient_index]
     
-    # Extract all 1,000 iterations for each richness level.
+    # Extract values for this nutrient
+    nutrient_values <- results_array[
+      ,
+      nutrient_index,
+      ,
+      drop = FALSE
+    ]
     
-    plot_data <- lapply(
-      1:n_species_selected,
-      function(k) {
-        
-        result_rows <- combination_start[k]:
-          combination_end[k]
-        
-        as.vector(
-          results_array[
-            result_rows,
-            nutrient_index,
-            ,
-            drop = FALSE
-          ]
-        )
-        
-      }
+    # Prepare plotting data
+    boxplot_data <- data.frame(
+      species_richness = factor(
+        rep(
+          combination_richness,
+          times = n_iterations
+        ),
+        levels = 1:10
+      ),
+      nutrient_value = as.vector(
+        nutrient_values
+      )
     )
     
-    # Create a safe filename.
+    # Remove missing values
+    boxplot_data <- boxplot_data[
+      is.finite(boxplot_data$nutrient_value),
+    ]
     
-    safe_nutrient_name <- gsub(
-      "[^A-Za-z0-9_-]+",
+    # Create boxplot
+    p_box <- ggplot(
+      boxplot_data,
+      aes(
+        x = species_richness,
+        y = nutrient_value
+      )
+    ) +
+      
+      geom_boxplot(
+        fill = "grey80",
+        colour = "black",
+        outlier.shape = NA
+      ) +
+      
+      labs(
+        title = paste(
+          nutrient_name,
+          "-",
+          pixel_id
+        ),
+        subtitle = paste(
+          "Nutrient concentration across all combinations"
+        ),
+        x = "Species richness",
+        y = paste(
+          nutrient_name,
+          "per 100 g"
+        )
+      ) +
+      
+      theme_classic() +
+      
+      theme(
+        plot.title = element_text(
+          face = "bold",
+          size = 13
+        )
+      )
+    
+    
+    # Safe filename
+    nutrient_file_name <- gsub(
+      "[^A-Za-z0-9_-]",
       "_",
       nutrient_name
     )
     
-    graph_file <- file.path(
-      plot_folder,
-      paste0(
-        pixel_id,
-        "_",
-        safe_nutrient_name,
-        ".png"
-      )
-    )
-    
-    png(
-      filename = graph_file,
-      width = 1600,
-      height = 1000,
-      res = 150
-    )
-    
-    boxplot(
-      plot_data,
-      names = 1:n_species_selected,
-      main = paste(
-        pixel_id,
-        "-",
-        nutrient_name
+    # Save boxplot inside this pixel's folder
+    ggsave(
+      filename = file.path(
+        boxplot_folder,
+        paste0(
+          pixel_id,
+          "_",
+          nutrient_file_name,
+          "_boxplot.png"
+        )
       ),
-      xlab = "Number of species in combination",
-      ylab = paste(
-        "Mean",
-        nutrient_name,
-        "per 100 g"
-      ),
-      col = "lightblue",
-      border = "grey30",
-      outline = FALSE
+      plot = p_box,
+      width = 8,
+      height = 6,
+      dpi = 300
     )
     
-    dev.off()
-    
+    rm(
+      nutrient_values,
+      boxplot_data,
+      p_box
+    )
   }
   
   
-  # ----------------------------------------------------------
-  # 5G. RECORD PIXEL COMPLETION
-  # ----------------------------------------------------------
+  # ==========================================================
+  # 11. GENERATE 13 SPECIES-RICHNESS RESPONSE CURVES
+  # ==========================================================
   
-  processing_time <- as.numeric(
+  cat(
+    "\nGenerating response curves for",
+    pixel_id,
+    "...\n"
+  )
+  
+  
+  for (nutrient_index in seq_along(nutrient_names)) {
+    
+    nutrient_name <- nutrient_names[nutrient_index]
+    
+    
+    # --------------------------------------------------------
+    # STEP 1. CALCULATE ITERATION-LEVEL MEANS
+    # --------------------------------------------------------
+    
+    # Rows = richness levels 1 to 10
+    # Columns = iterations 1 to 1,000
+    
+    iteration_means <- matrix(
+      NA_real_,
+      nrow = n_species_selected,
+      ncol = n_iterations
+    )
+    
+    
+    for (k in 1:n_species_selected) {
+      
+      # Identify combinations with richness k
+      richness_rows <- which(
+        combination_richness == k
+      )
+      
+      # Extract values for those combinations
+      richness_values <- results_array[
+        richness_rows,
+        nutrient_index,
+        ,
+        drop = FALSE
+      ]
+      
+      # Convert to matrix:
+      # rows = combinations
+      # columns = iterations
+      
+      richness_matrix <- matrix(
+        richness_values,
+        nrow = length(richness_rows),
+        ncol = n_iterations
+      )
+      
+      # Average all combinations within each iteration.
+      #
+      # Each iteration contributes ONE mean value
+      # for each richness level.
+      
+      iteration_means[k, ] <- colMeans(
+        richness_matrix,
+        na.rm = TRUE
+      )
+    }
+    
+    
+    # --------------------------------------------------------
+    # STEP 2. CALCULATE MEAN AND 95% CONFIDENCE INTERVAL
+    # --------------------------------------------------------
+    
+    response_summary <- data.frame(
+      species_richness = 1:n_species_selected,
+      mean = rep(NA_real_, n_species_selected),
+      lower_ci = rep(NA_real_, n_species_selected),
+      upper_ci = rep(NA_real_, n_species_selected),
+      n_iterations = rep(0L, n_species_selected)
+    )
+    
+    for (k in 1:n_species_selected) {
+      
+      values <- iteration_means[k, ]
+      
+      # Remove missing and non-finite values
+      values <- values[
+        is.finite(values)
+      ]
+      
+      n_valid <- length(values)
+      
+      response_summary$n_iterations[k] <- n_valid
+      
+      if (n_valid > 1) {
+        
+        mean_value <- mean(values)
+        
+        standard_error <- sd(values) /
+          sqrt(n_valid)
+        
+        critical_value <- qt(
+          0.975,
+          df = n_valid - 1
+        )
+        
+        response_summary$mean[k] <- mean_value
+        
+        response_summary$lower_ci[k] <-
+          mean_value -
+          critical_value * standard_error
+        
+        response_summary$upper_ci[k] <-
+          mean_value +
+          critical_value * standard_error
+      }
+    }
+    
+    
+    # --------------------------------------------------------
+    # STEP 3. CREATE RESPONSE CURVE
+    # --------------------------------------------------------
+    
+    p_response <- ggplot(
+      response_summary,
+      aes(
+        x = species_richness,
+        y = mean
+      )
+    ) +
+      
+      # 95% confidence interval
+      geom_ribbon(
+        aes(
+          ymin = lower_ci,
+          ymax = upper_ci
+        ),
+        fill = "grey70",
+        alpha = 0.5
+      ) +
+      
+      # Mean response line
+      geom_line(
+        colour = "black",
+        linewidth = 0.8
+      ) +
+      
+      # Mean response points
+      geom_point(
+        colour = "black",
+        size = 2
+      ) +
+      
+      scale_x_continuous(
+        breaks = 1:10,
+        limits = c(1, 10)
+      ) +
+      
+      labs(
+        title = paste(
+          nutrient_name,
+          "-",
+          pixel_id
+        ),
+        subtitle = paste(
+          "Mean nutrient concentration with 95% confidence interval"
+        ),
+        x = "Species richness",
+        y = paste(
+          nutrient_name,
+          "per 100 g"
+        )
+      ) +
+      
+      theme_classic() +
+      
+      theme(
+        plot.title = element_text(
+          face = "bold",
+          size = 13
+        )
+      )
+    
+    
+    # --------------------------------------------------------
+    # STEP 4. SAVE RESPONSE CURVE
+    # --------------------------------------------------------
+    
+    nutrient_file_name <- gsub(
+      "[^A-Za-z0-9_-]",
+      "_",
+      nutrient_name
+    )
+    
+    ggsave(
+      filename = file.path(
+        response_folder,
+        paste0(
+          pixel_id,
+          "_",
+          nutrient_file_name,
+          "_response_curve.png"
+        )
+      ),
+      plot = p_response,
+      width = 8,
+      height = 6,
+      dpi = 300
+    )
+    
+    
+    # Release nutrient-specific objects
+    rm(
+      iteration_means,
+      response_summary,
+      p_response
+    )
+  }
+  
+  
+  # ==========================================================
+  # 12. SAVE PIXEL SUMMARY
+  # ==========================================================
+  
+  processing_minutes <- as.numeric(
     difftime(
       Sys.time(),
-      pixel_start_time,
+      start_time,
       units = "mins"
     )
   )
   
-  pixel_summary[[pixel]] <- data.frame(
-    pixel_id = pixel_id,
-    original_raster_cell = original_cell,
-    eligible_species = n_eligible,
-    status = "Completed",
-    output_file = basename(csv_file),
-    processing_minutes = processing_time
+  pixel_summary <- rbind(
+    pixel_summary,
+    data.frame(
+      pixel_number = pixel,
+      original_raster_cell = original_cell,
+      status = "Completed",
+      output_file = output_file,
+      processing_minutes = processing_minutes
+    )
   )
   
+  
+  # ==========================================================
+  # 13. PIXEL COMPLETED
+  # ==========================================================
+  
+  cat("\n")
+  cat("----------------------------------------------------\n")
+  cat("COMPLETED:", pixel_id, "\n")
   cat(
-    "\nCompleted:",
-    pixel_id,
-    "\nTime:",
-    round(processing_time, 2),
+    "Processing time:",
+    round(processing_minutes, 2),
     "minutes\n"
   )
+  cat("Output folder:", pixel_folder, "\n")
+  cat("----------------------------------------------------\n")
   
-  # Release memory before moving to the next pixel.
+  
+  # ==========================================================
+  # 14. RELEASE MEMORY
+  # ==========================================================
   
   rm(results_array)
-  gc()
   
+  gc()
 }
 
 
-# ------------------------------------------------------------
-# 6. SAVE OVERALL SUMMARY
-# ------------------------------------------------------------
-
-pixel_summary_df <- dplyr::bind_rows(
-  pixel_summary
-)
+# ============================================================
+# 15. SAVE FINAL SUMMARY
+# ============================================================
 
 summary_file <- file.path(
   output_folder,
@@ -2024,46 +2458,54 @@ summary_file <- file.path(
 )
 
 write.csv(
-  pixel_summary_df,
+  pixel_summary,
   summary_file,
   row.names = FALSE
 )
 
 
-# ------------------------------------------------------------
-# 7. FINAL REPORT
-# ------------------------------------------------------------
+# ============================================================
+# 16. FINAL REPORT
+# ============================================================
 
-cat("\n\n====================================\n")
-cat("SIMULATION WORKFLOW FINISHED\n")
-cat("====================================\n")
+completed_pixels <- sum(
+  pixel_summary$status == "Completed"
+)
+
+skipped_pixels <- sum(
+  pixel_summary$status != "Completed"
+)
+
+cat("\n")
+cat("====================================================\n")
+cat("ALL SIMULATIONS FINISHED\n")
+cat("====================================================\n")
+
+cat("Completed pixels:", completed_pixels, "\n")
+cat("Skipped pixels:", skipped_pixels, "\n")
 
 cat(
-  "Pixels processed:",
-  sum(pixel_summary_df$status == "Completed"),
+  "Total boxplots:",
+  completed_pixels * 13,
   "\n"
 )
 
 cat(
-  "Pixels skipped:",
-  sum(pixel_summary_df$status != "Completed"),
+  "Total response curves:",
+  completed_pixels * 13,
   "\n"
 )
 
 cat(
-  "Total combinations per selection:",
-  total_combinations,
+  "Total graph files:",
+  completed_pixels * 26,
   "\n"
 )
 
-cat(
-  "Iterations per pixel:",
-  n_iterations,
-  "\n"
-)
+cat("\nMain output folder:\n")
+cat(output_folder, "\n")
 
-cat(
-  "Summary saved to:",
-  summary_file,
-  "\n"
-)
+cat("\nSummary file:\n")
+cat(summary_file, "\n")
+
+cat("\n====================================================\n")
